@@ -60,6 +60,8 @@ type Interactor interface {
 	MergeAndCheckout(baseSHA string, mergeStrategy string, headSHAs ...string) error
 	// Am calls `git am`
 	Am(path string) error
+	// Apply calls `git apply --3way --index` to apply a unified diff
+	Apply(path string) error
 	// Fetch calls `git fetch arg...`
 	Fetch(arg ...string) error
 	// FetchRef fetches the refspec
@@ -440,6 +442,17 @@ func (i *interactor) Am(path string) error {
 
 // FetchCommits only fetches those commits which we want, and only if they are
 // missing.
+// Apply applies a unified diff onto the current tree and stages the result.
+// Unlike Am it does not create a commit, so the caller controls commit
+// authorship and message (used for squashed cherry-picks).
+func (i *interactor) Apply(path string) error {
+	i.logger.Infof("Applying diff at %s", path)
+	if out, err := i.executor.Run("apply", "--3way", "--index", path); err != nil {
+		return fmt.Errorf("error applying diff: %w. output: %s", err, string(out))
+	}
+	return nil
+}
+
 func (i *interactor) FetchCommits(commitSHAs []string) error {
 	fetchArgs := []string{"--no-write-fetch-head", "--no-tags"}
 

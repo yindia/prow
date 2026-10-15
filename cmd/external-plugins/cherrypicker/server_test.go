@@ -47,6 +47,7 @@ type fghc struct {
 
 	diff       []byte
 	patch      []byte
+	prCommits  []github.RepositoryCommit
 	comments   []string
 	prs        []github.PullRequest
 	prComments []github.IssueComment
@@ -98,6 +99,12 @@ func (f *fghc) GetPullRequestPatch(org, repo string, number int) ([]byte, error)
 	f.Lock()
 	defer f.Unlock()
 	return f.patch, nil
+}
+
+func (f *fghc) ListPullRequestCommits(org, repo string, number int) ([]github.RepositoryCommit, error) {
+	f.Lock()
+	defer f.Unlock()
+	return f.prCommits, nil
 }
 
 func (f *fghc) GetPullRequests(org, repo string) ([]github.PullRequest, error) {
@@ -1462,4 +1469,69 @@ func (p *prNumberGenerator) GetPRNumber() int {
 	defer p.Unlock()
 	p.prNumber = p.prNumber + 10
 	return p.prNumber
+}
+
+func mkCommit(name, email string, parents int) github.RepositoryCommit {
+	c := github.RepositoryCommit{
+		Commit: github.GitCommit{Author: github.CommitAuthor{Name: name, Email: email}},
+	}
+	for range parents {
+		c.Parents = append(c.Parents, github.GitCommit{})
+	}
+	return c
+}
+
+func TestSquashCommitBody(t *testing.T) {
+	s := &Server{
+		botUser: &github.UserData{Login: "ci-robot", Email: "ci-robot@users.noreply.github.com"},
+	}
+	cases := map[string]struct {
+		commits []github.RepositoryCommit
+		want    string
+	}{
+		"single author": {
+			commits: []github.RepositoryCommit{mkCommit("Alice", "alice@x.io", 1)},
+			want: "Signed-off-by: ci-robot <ci-robot@users.noreply.github.com>\n" +
+				"Co-authored-by: Alice <alice@x.io>",
+		},
+		"dedup repeated author": {
+			commits: []github.RepositoryCommit{
+				mkCommit("Alice", "alice@x.io", 1),
+				mkCommit("Alice", "alice@x.io", 1),
+				mkCommit("Bob", "bob@x.io", 1),
+			},
+			want: "Signed-off-by: ci-robot <ci-robot@users.noreply.github.com>\n" +
+				"Co-authored-by: Alice <alice@x.io>\n" +
+				"Co-authored-by: Bob <bob@x.io>",
+		},
+		"skip merge commit author": {
+			commits: []github.RepositoryCommit{
+				mkCommit("Alice", "alice@x.io", 1),
+				mkCommit("Merge Bot", "merge@x.io", 2), // merge commit -> excluded
+			},
+			want: "Signed-off-by: ci-robot <ci-robot@users.noreply.github.com>\n" +
+				"Co-authored-by: Alice <alice@x.io>",
+		},
+		"skip author missing name or email": {
+			commits: []github.RepositoryCommit{
+				mkCommit("", "noname@x.io", 1),
+				mkCommit("NoEmail", "", 1),
+				mkCommit("Alice", "alice@x.io", 1),
+			},
+			want: "Signed-off-by: ci-robot <ci-robot@users.noreply.github.com>\n" +
+				"Co-authored-by: Alice <alice@x.io>",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s.ghc = &fghc{prCommits: tc.commits}
+			got, err := s.squashCommitBody("foo", "bar", 1)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("body mismatch:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
 }

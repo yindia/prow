@@ -58,6 +58,8 @@ type githubClient interface {
 	EnsureFork(forkingUser, org, repo string) (string, error)
 	GetPullRequest(org, repo string, number int) (*github.PullRequest, error)
 	GetPullRequestPatch(org, repo string, number int) ([]byte, error)
+	GetPullRequestDiff(org, repo string, number int) ([]byte, error)
+	ListPullRequestCommits(org, repo string, number int) ([]github.RepositoryCommit, error)
 	GetPullRequests(org, repo string) ([]github.PullRequest, error)
 	GetRepo(owner, name string) (github.FullRepo, error)
 	IsMember(org, user string) (bool, error)
@@ -103,6 +105,8 @@ type Server struct {
 	allowAll bool
 	// Create an issue on cherrypick conflict.
 	issueOnConflict bool
+	// Apply the PR as a single squashed commit instead of per-commit `git am`.
+	squashCommits bool
 	// Set a custom label prefix.
 	labelPrefix string
 
@@ -566,8 +570,14 @@ func (s *Server) handle(logger logrus.FieldLogger, requester string, comment *gi
 	}
 	logger.WithField("duration", time.Since(startClone)).Info("Cloned and checked out target branch.")
 
-	// Fetch the patch from GitHub
-	localPath, err := s.getPatch(org, repo, targetBranch, num)
+	// Fetch the changes from GitHub: a per-commit patch for `git am`, or the
+	// PR's net diff for a single squashed apply.
+	var localPath string
+	if s.squashCommits {
+		localPath, err = s.getDiff(org, repo, targetBranch, num)
+	} else {
+		localPath, err = s.getPatch(org, repo, targetBranch, num)
+	}
 	if err != nil {
 		logger.WithError(err).Errorf("Failed to get patch for %s/%s#%d", org, repo, num)
 		return s.createComment(logger, org, repo, num, comment, fmt.Sprintf("Failed to get PR patch from GitHub. This PR will need to be manually cherrypicked.\n<details><summary>Error message</summary>%v</details>", err))
@@ -612,9 +622,15 @@ func (s *Server) handle(logger logrus.FieldLogger, requester string, comment *gi
 	titleTargetBranchIndicator := fmt.Sprintf(titleTargetBranchIndicatorTemplate, targetBranch)
 	title = fmt.Sprintf("%s%s", titleTargetBranchIndicator, omitBaseBranchFromTitle(title, baseBranch))
 
-	// Apply the patch.
-	if err := r.Am(localPath); err != nil {
-		errs := []error{fmt.Errorf("failed to `git am`: %w", err)}
+	// Apply the changes: a squashed single commit, or per-commit `git am`.
+	var applyErr error
+	if s.squashCommits {
+		applyErr = s.squashApply(r, localPath, title, org, repo, num)
+	} else {
+		applyErr = r.Am(localPath)
+	}
+	if err := applyErr; err != nil {
+		errs := []error{fmt.Errorf("failed to apply PR on top of target branch: %w", err)}
 		logger.WithError(err).Warn("failed to apply PR on top of target branch")
 		resp := fmt.Sprintf("#%d failed to apply on top of branch %q:\n```\n%v\n```", num, targetBranch, err)
 		if err := s.createComment(logger, org, repo, num, comment, resp); err != nil {
@@ -765,6 +781,68 @@ func (s *Server) getPatch(org, repo, targetBranch string, num int) (string, erro
 	}
 
 	return localPath, nil
+}
+
+// getDiff fetches the PR's net (squashed) diff and writes it to a local file.
+func (s *Server) getDiff(org, repo, targetBranch string, num int) (string, error) {
+	diff, err := s.ghc.GetPullRequestDiff(org, repo, num)
+	if err != nil {
+		return "", err
+	}
+
+	localPath := fmt.Sprintf("/tmp/%s_%s_%d_%s.diff", org, repo, num, normalize(targetBranch))
+	if err := os.WriteFile(localPath, diff, 0644); err != nil {
+		return "", err
+	}
+
+	return localPath, nil
+}
+
+// squashApply applies the PR's net diff and records it as a single commit.
+// The commit body carries a Signed-off-by trailer (DCO) plus one
+// Co-authored-by trailer per original author, preserving authorship.
+func (s *Server) squashApply(r git.RepoClient, localPath, title, org, repo string, num int) error {
+	if err := r.Apply(localPath); err != nil {
+		return err
+	}
+	body, err := s.squashCommitBody(org, repo, num)
+	if err != nil {
+		return err
+	}
+	return r.Commit(title, body)
+}
+
+// squashCommitBody builds the commit body for a squashed cherry-pick: a
+// Signed-off-by trailer for the bot (the original per-commit sign-offs are lost
+// when squashing) followed by unique Co-authored-by trailers for every non-merge
+// commit author.
+func (s *Server) squashCommitBody(org, repo string, num int) (string, error) {
+	commits, err := s.ghc.ListPullRequestCommits(org, repo, num)
+	if err != nil {
+		return "", fmt.Errorf("failed to list PR commits: %w", err)
+	}
+	email := s.email
+	if email == "" {
+		email = s.botUser.Email
+	}
+	trailers := []string{fmt.Sprintf("Signed-off-by: %s <%s>", s.botUser.Login, email)}
+	seen := sets.New[string]()
+	for _, c := range commits {
+		if len(c.Parents) > 1 {
+			continue // skip merge commits; their author is the merger, not a contributor
+		}
+		author := c.Commit.Author
+		if author.Name == "" || author.Email == "" {
+			continue
+		}
+		line := fmt.Sprintf("Co-authored-by: %s <%s>", author.Name, author.Email)
+		if seen.Has(line) {
+			continue
+		}
+		seen.Insert(line)
+		trailers = append(trailers, line)
+	}
+	return strings.Join(trailers, "\n"), nil
 }
 
 func normalize(input string) string {
